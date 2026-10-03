@@ -70,16 +70,7 @@
   #scene{perspective:1000px;height:380px;display:flex;align-items:center;justify-content:center;
     background:linear-gradient(180deg,#fbfcff,#eef2fb);border-radius:14px;cursor:grab;user-select:none;touch-action:none;}
   #scene:active{cursor:grabbing;}
-  #cube{position:relative;width:0;height:0;transform-style:preserve-3d;}
-  .cubie{position:absolute;left:50%;top:50%;width:54px;height:54px;transform-style:preserve-3d;transform-origin:0 0 0;}
-  .cface{position:absolute;left:0;top:0;width:54px;height:54px;border-radius:7px;
-    border:1px solid rgba(0,0,0,.35);box-shadow:inset 0 0 0 2px rgba(255,255,255,.18);}
-  .cface.px{transform:rotateY(90deg) translateZ(27px);}
-  .cface.nx{transform:rotateY(-90deg) translateZ(27px);}
-  .cface.py{transform:rotateX(90deg) translateZ(27px);}
-  .cface.ny{transform:rotateX(-90deg) translateZ(27px);}
-  .cface.pz{transform:translateZ(27px);}
-  .cface.nz{transform:rotateY(180deg) translateZ(27px);}
+  #scene canvas{display:block;margin:0 auto;}
 
   .curmove{margin-top:10px;text-align:center;font-size:15px;font-weight:700;color:var(--accent);min-height:22px;}
 
@@ -175,7 +166,7 @@
     <div class="stage">
       <div class="card">
         <h3>实时魔方（可拖拽旋转视角）</h3>
-        <div id="scene"><div id="cube"></div></div>
+        <div id="scene"></div>
         <div class="curmove" id="curMove">把你的魔方状态涂好，点“求解还原”开始</div>
       </div>
 
@@ -221,6 +212,7 @@
   </div>
 </div>
 
+<script src="three.min.js"></script>
 <script>
 var module={exports:{}};var exports=module.exports;
 "use strict";
@@ -1392,7 +1384,7 @@ if (typeof window !== 'undefined') {
 
   // ----- DOM refs -----
   const $ = id => document.getElementById(id);
-  const paletteEl=$('palette'), netEl=$('net'), sceneEl=$('scene'), cubeEl=$('cube');
+  const paletteEl=$('palette'), netEl=$('net'), sceneEl=$('scene');
   const msgEl=$('msg'), curMoveEl=$('curMove'), stepPanel=$('stepPanel'), stepsEl=$('steps');
   const progText=$('progText'), progBar=$('progBar'), doneBanner=$('doneBanner');
 
@@ -1600,108 +1592,141 @@ if (typeof window !== 'undefined') {
     return null;
   }
 
-  // ----- build 26 cubie DOM -----
-  const cubieEls=[];
+  // ===================== Three.js 真实 3D 魔方 =====================
+  // WebGL 渲染：黑色塑料体 + 内嵌彩色贴纸；转层绕魔方中心轴刚性旋转。
+  const THREE = window.THREE;
+  const CELL = 1.0;   // 每格间距（世界单位）
+  const BODY = 0.97;  // cubie 本体尺寸（黑色塑料，紧贴形成黑缝）
+  const STK  = 0.82;  // 贴纸尺寸（内嵌，留黑边）
+
+  // 方向键 -> 盒子面（与 cu.c 一致：px=+X(R) nx=-X(L) py=+Y(U) ny=-Y(D) pz=+Z(F) nz=-Z(B)）
+  const DIR_FACE = {
+    px:{axis:'x',sign: 1, rx:0,         ry: Math.PI/2},
+    nx:{axis:'x',sign:-1, rx:0,         ry:-Math.PI/2},
+    py:{axis:'y',sign: 1, rx:-Math.PI/2, ry:0},
+    ny:{axis:'y',sign:-1, rx: Math.PI/2, ry:0},
+    pz:{axis:'z',sign: 1, rx:0,         ry:0},
+    nz:{axis:'z',sign:-1, rx:0,         ry: Math.PI}
+  };
+
+  const tScene = new THREE.Scene();
+  const tCamera = new THREE.PerspectiveCamera(42, 1, 0.1, 100);
+  tCamera.position.set(4.4, 4.0, 5.8); tCamera.lookAt(0,0,0);
+  const tRenderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });
+  tRenderer.setPixelRatio(Math.min(window.devicePixelRatio||1, 2));
+  sceneEl.appendChild(tRenderer.domElement);
+
+  tScene.add(new THREE.AmbientLight(0xffffff, 0.50));
+  const tKey = new THREE.DirectionalLight(0xffffff, 0.72); tKey.position.set(6,9,7);  tScene.add(tKey);
+  const tFill= new THREE.DirectionalLight(0xffffff, 0.30); tFill.position.set(-7,-2,-5); tScene.add(tFill);
+  const tRim = new THREE.DirectionalLight(0xffffff, 0.18); tRim.position.set(0,-7,4);   tScene.add(tRim);
+
+  const viewGroup = new THREE.Group();   // 视角（拖拽 / 空闲自转）
+  const cubeGroup = new THREE.Group();   // 魔方本体（26 cubie）
+  viewGroup.add(cubeGroup); tScene.add(viewGroup);
+  viewGroup.rotation.x = -0.40; viewGroup.rotation.y = 0.62;  // 初始看到 U/R/F 三面
+
+  // ----- 构建 26 个 cubie 网格（顺序同 CM.solvedCubies）-----
+  const cubieMeshes = [];
   (function buildCubies(){
-    // create in same order as CM.solvedCubies()
-    const model=CM.solvedCubies();
-    model.forEach((cu)=>{
-      const el=document.createElement('div'); el.className='cubie';
-      const dirs=['px','nx','py','ny','pz','nz'];
-      const coord={px:cu.x,nx:cu.x,py:cu.y,ny:cu.y,pz:cu.z,nz:cu.z};
-      dirs.forEach(d=>{
-        // build all 6 faces once; interior ones are hidden via visibility
-        const f=document.createElement('div'); f.className='cface '+d; f.dataset.d=d;
-        el.appendChild(f);
+    const model = CM.solvedCubies();
+    const bodyGeo = new THREE.BoxGeometry(BODY, BODY, BODY);
+    const stkGeo  = new THREE.PlaneGeometry(STK, STK);
+    const bodyMat = new THREE.MeshStandardMaterial({ color:0x15181d, roughness:0.5, metalness:0.04 });
+    model.forEach(()=>{
+      const g = new THREE.Group();
+      g.add(new THREE.Mesh(bodyGeo, bodyMat));
+      const mats = {};
+      Object.keys(DIR_FACE).forEach(d=>{
+        const m = new THREE.MeshStandardMaterial({ color:0x222831, roughness:0.4, metalness:0.0 });
+        const p = new THREE.Mesh(stkGeo, m);
+        const f = DIR_FACE[d], off = BODY/2 + 0.002;
+        p.rotation.x = f.rx; p.rotation.y = f.ry;
+        p.position.x = f.axis==='x' ? f.sign*off : 0;
+        p.position.y = f.axis==='y' ? f.sign*off : 0;
+        p.position.z = f.axis==='z' ? f.sign*off : 0;
+        g.add(p); mats[d] = m;
       });
-      cubeEl.appendChild(el);
-      cubieEls.push(el);
+      cubeGroup.add(g); cubieMeshes.push({ group:g, mats });
     });
   })();
 
   function renderCubies(){
     cubies.forEach((cu,i)=>{
-      const el=cubieEls[i];
-      const X=cu.x*UNIT, Y=-cu.y*UNIT, Z=cu.z*UNIT;
-      el.style.transition='none';
-      el.style.transform=`translate3d(calc(-50% + ${X}px), calc(-50% + ${Y}px), ${Z}px)`;
-      // every cubie already owns all 6 faces; just colour + toggle visibility
-      const onSurface={
-        px: cu.x===1, nx: cu.x===-1,
-        py: cu.y===1, ny: cu.y===-1,
-        pz: cu.z===1, nz: cu.z===-1
-      };
-      el.querySelectorAll('.cface').forEach(f=>{
-        const d=f.dataset.d;
-        if(onSurface[d]){
-          f.style.visibility='visible';
-          const col=cu.c[d];
-          f.style.background = col ? col : '#222831';
-        }else{
-          f.style.visibility='hidden';
+      const cm = cubieMeshes[i];
+      cm.group.position.set(cu.x*CELL, cu.y*CELL, cu.z*CELL);
+      cm.group.rotation.set(0,0,0);
+      const surf = { px:cu.x===1, nx:cu.x===-1, py:cu.y===1, ny:cu.y===-1, pz:cu.z===1, nz:cu.z===-1 };
+      Object.keys(cm.mats).forEach(d=>{
+        if(surf[d]){
+          let col = cu.c[d];
+          if(col && col.length===1) col = null;            // 理论上不会出现单字母
+          cm.mats[d].color.set(col || '#222831');
+          cm.mats[d].visible = true;
+        } else {
+          cm.mats[d].visible = false;                       // 内面贴纸隐藏，露出黑色本体
         }
       });
     });
   }
 
-  // ----- animate a single move on the model -----
+  // ----- 单步转动：该层 9 块作为刚性圆盘绕魔方中心轴旋转 -----
   function animateMove(face, dir, done){
-    animating=true;
-    const [axis,layer]=FACE_AXIS[face];
-    const sign = (axis==='y') ? dir : -dir;
-    const theta = sign*90;
-    const A=axis.toUpperCase();
-    // compute post-move positions without touching the live model yet
-    const post=JSON.parse(JSON.stringify(cubies));
-    CM.applyMove(post, face, dir);
-
-    // 1) set each layer cubie to its OLD transform (no rotation) as the start
-    cubies.forEach((cu,i)=>{
-      if(cu[axis]!==layer) return;
-      const el=cubieEls[i];
-      // light up all faces so none appear empty while the layer revolves
-      el.querySelectorAll('.cface').forEach(f=>{ f.style.visibility='visible'; });
-      const X=cu.x*UNIT, Y=-cu.y*UNIT, Z=cu.z*UNIT;
-      el.style.transition='none';
-      el.style.transform=`rotate${A}(0deg) translate3d(calc(-50% + ${X}px), calc(-50% + ${Y}px), ${Z}px)`;
-    });
-    // force reflow so the "from" state sticks before we add the transition
-    void cubeEl.offsetHeight;
-
-    // 2) animate to the NEW transform — orbiting the cube centre via rotate+translate
-    cubies.forEach((cu,i)=>{
-      if(cu[axis]!==layer) return;
-      const el=cubieEls[i];
-      const np=post[i];
-      const X=np.x*UNIT, Y=-np.y*UNIT, Z=np.z*UNIT;
-      el.style.transition='transform .34s ease-in-out';
-      el.style.transform=`rotate${A}(${theta}deg) translate3d(calc(-50% + ${X}px), calc(-50% + ${Y}px), ${Z}px)`;
-    });
-
-    setTimeout(()=>{
-      CM.applyMove(cubies, face, dir);
-      renderCubies();            // commit colours + visibility for the new orientation
-      syncNetFromCube();         // 网图实时跟随魔方
-      animating=false;
-      done&&done();
-    },350);
+    animating = true;
+    const [axis, layer] = FACE_AXIS[face];
+    const theta = dir * Math.PI/2;   // 绕魔方中心轴；dir=+1/-1 对应标准转法
+    const pivot = new THREE.Group(); cubeGroup.add(pivot);
+    const layerIdx = [];
+    cubies.forEach((cu,i)=>{ if(cu[axis]===layer){ pivot.attach(cubieMeshes[i].group); layerIdx.push(i); } });
+    const dur = 320, t0 = performance.now();
+    (function tween(now){
+      let t = Math.min(1, (now - t0)/dur);
+      const e = t<0.5 ? 2*t*t : 1 - Math.pow(-2*t+2,2)/2;   // easeInOutQuad
+      pivot.rotation[axis] = theta * e;
+      if(t < 1) requestAnimationFrame(tween);
+      else {
+        pivot.rotation[axis] = theta; pivot.updateMatrixWorld(true);
+        layerIdx.forEach(i=> cubeGroup.attach(cubieMeshes[i].group));
+        cubeGroup.remove(pivot);
+        CM.applyMove(cubies, face, dir);
+        renderCubies(); syncNetFromCube();   // 提交模型并重新着色 / 网图跟随
+        animating = false; done && done();
+      }
+    })(t0);
   }
 
-  // ----- scene drag rotate -----
-  let vx=-22, vy=35, dragging=false, lastX=0, lastY=0;
-  function applyCubeRot(){ cubeEl.style.transform=`rotateX(${vx}deg) rotateY(${vy}deg)`; }
-  applyCubeRot();
-  sceneEl.addEventListener('pointerdown',e=>{ dragging=true; lastX=e.clientX; lastY=e.clientY; sceneEl.setPointerCapture(e.pointerId); });
-  sceneEl.addEventListener('pointermove',e=>{
+  // ----- 视角拖拽 + 空闲自转 + 渲染循环 -----
+  let dragging=false, lastX=0, lastY=0;
+  sceneEl.addEventListener('pointerdown', e=>{
+    dragging=true; lastX=e.clientX; lastY=e.clientY;
+    if(sceneEl.setPointerCapture){ try{ sceneEl.setPointerCapture(e.pointerId); }catch(_){} }
+  });
+  sceneEl.addEventListener('pointermove', e=>{
     if(!dragging) return;
-    vy += (e.clientX-lastX)*0.5; vx -= (e.clientY-lastY)*0.5;
-    vx=Math.max(-85,Math.min(85,vx));
-    lastX=e.clientX; lastY=e.clientY; applyCubeRot();
+    const dx=e.clientX-lastX, dy=e.clientY-lastY;
+    viewGroup.rotation.y += dx*0.01;
+    viewGroup.rotation.x += dy*0.01;
+    viewGroup.rotation.x = Math.max(-1.3, Math.min(1.3, viewGroup.rotation.x));
+    lastX=e.clientX; lastY=e.clientY;
   });
   const endDrag=()=>{ dragging=false; };
-  sceneEl.addEventListener('pointerup',endDrag);
-  sceneEl.addEventListener('pointercancel',endDrag);
-  (function idle(){ if(!dragging && !animating && !solving){ vy+=0.12; applyCubeRot(); } requestAnimationFrame(idle); })();
+  sceneEl.addEventListener('pointerup', endDrag);
+  sceneEl.addEventListener('pointercancel', endDrag);
+  sceneEl.addEventListener('pointerleave', endDrag);
+
+  function resize(){
+    const w = Math.max(320, sceneEl.clientWidth  || 360);
+    const h = Math.max(320, sceneEl.clientHeight || 380);
+    tRenderer.setSize(w, h);
+    tCamera.aspect = w/h; tCamera.updateProjectionMatrix();
+  }
+  window.addEventListener('resize', resize); resize();
+
+  (function loop(){
+    if(!dragging && !animating){ viewGroup.rotation.y += 0.0035; }  // 空闲缓慢自转
+    tRenderer.render(tScene, tCamera);
+    requestAnimationFrame(loop);
+  })();
 
   // ----- messages -----
   function setMsg(t, type){ msgEl.textContent=t||''; msgEl.className=type||''; }
@@ -2006,6 +2031,7 @@ if (typeof window !== 'undefined') {
   $('startBtn').addEventListener('click',()=>{
     $('intro').classList.add('hidden');
     $('app').classList.remove('hidden');
+    if(typeof resize==='function') resize();
     renderCubies();
   });
 
