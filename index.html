@@ -1074,12 +1074,36 @@ function initSolver() {
   pruningTables = buildPruningTables(moveTables);
   solverReady = true;
 }
+// 快速预检：对“几乎已复原”的局面暴力枚举 1~2 步解。每找到一个即用 isSolved() 验证，
+// 保证返回的解一定正确；这能让“仅 1~2 步即可还原”的局面（含正/逆向四分之一转）拿到最优解，
+// 避免两阶段搜索在近乎复原的局面下给出很长的非最优解。若无解则返回 null，交由主求解器处理。
+function quickSolve(c) {
+  const faces = ['U', 'R', 'F', 'D', 'L', 'B'];
+  const suff = ["", "'", '2'];
+  for (const f of faces) for (const s of suff) {
+    const t = c.clone(); t.move(f + s);
+    if (t.isSolved()) return f + s;
+  }
+  for (const f1 of faces) for (const s1 of suff) for (const f2 of faces) for (const s2 of suff) {
+    const t = c.clone(); t.move(f1 + s1); t.move(f2 + s2);
+    if (t.isSolved()) return f1 + s1 + ' ' + f2 + s2;
+  }
+  return null;
+}
 function solve(cube, maxDepth = 22) {
   initSolver();
   const clone = cube.clone();
   const uprightAlg = clone.upright();
   clone.move(uprightAlg);
   const rotation = Array.from(clone.center);
+  // 先尝试快速预检（1~2 步最优解），命中即返回，跳过较重的两阶段搜索
+  const quick = quickSolve(clone);
+  if (quick !== null) {
+    return quick.trim().split(/\s+/).filter(Boolean).map((m) => {
+      const originalFace = rotation[faceNums[m[0]]];
+      return faceNames[originalFace] + (m.length > 1 ? m[1] : "");
+    }).join(" ");
+  }
   const uprightSolution = _solveUpright(clone, maxDepth);
   if (uprightSolution === null) return null;
   return uprightSolution.trim().split(/\s+/).filter(Boolean).map((m) => {
@@ -1135,10 +1159,21 @@ function _solveUpright(cube, maxDepth) {
     { length: maxDepth + 1 },
     () => new SearchState().setTables(mt, pt)
   );
+  // phase-2 必须使用独立的对象池：phase-1 在叶子节点调用 phase2search 时，
+  // 其递归链上的祖先状态仍占用 freeStates，若 phase-2 复用同一池会覆盖祖先字段，
+  // 导致搜索树损坏并陷入死循环（某些局面下求解器卡死）。
+  const freeStates2 = Array.from(
+    { length: maxDepth + 1 },
+    () => new SearchState().setTables(mt, pt)
+  );
   const phase1 = (ss, depth) => {
     if (found.solution !== null) return;
     if (depth === 0) {
-      if (ss.minDist1() === 0 && (ss.lastMove === null || !allMoves2.includes(ss.lastMove))) {
+      // phase-1 到达 G1 后一律交给 phase2search：它内部会在已复原(minDist2===0)时
+      // 直接记录 phase-1 路径本身（最优解），从而修复“最后一步恰好是 phase-2 生成元时
+      // 最优 1 步解被漏掉、退化为很长的解”的缺陷。phase-2 使用独立对象池 freeStates2，
+      // 不会破坏 phase-1 的祖先链，保证解序列正确。
+      if (ss.minDist1() === 0) {
         phase2search(ss);
       }
     } else if (ss.minDist1() <= depth) {
@@ -1159,6 +1194,9 @@ function _solveUpright(cube, maxDepth) {
   };
   const phase2search = (ss) => {
     ss.init2();
+    // 关键修复：phase-1 到达 G1 后，若本身已是复原态(phase-2 长度 0)，应直接返回，
+    // 否则会漏掉最短解（如仅 1 步可还原的魔方），退而求其次给出很长的解。
+    if (ss.minDist2() === 0) { found.solution = ss.solution(); return; }
     for (let depth = 1; depth <= maxDepth - ss.depth; depth++) {
       phase2(ss, depth);
       if (found.solution !== null) return;
@@ -1171,7 +1209,7 @@ function _solveUpright(cube, maxDepth) {
     } else if (ss.minDist2() <= depth) {
       const candidates = ss.lastMove !== null ? nextMoves2[Math.floor(ss.lastMove / 3)] : allMoves2;
       for (const move of candidates) {
-        const next = freeStates.pop();
+        const next = freeStates2.pop();
         next.parent = ss;
         next.lastMove = move;
         next.depth = ss.depth + 1;
@@ -1180,7 +1218,7 @@ function _solveUpright(cube, maxDepth) {
         next.parity = mt.parity[ss.parity][move];
         next.URtoDF = mt.URtoDF[ss.URtoDF][move];
         phase2(next, depth - 1);
-        freeStates.push(next);
+        freeStates2.push(next);
         if (found.solution !== null) return;
       }
     }
@@ -1609,6 +1647,38 @@ if (typeof window !== 'undefined') {
     nz:{axis:'z',sign:-1, rx:0,         ry: Math.PI}
   };
 
+  // ----- 圆角工具：让魔方更像真实塑料（棱角圆润）-----
+  function roundedRectShape(w, h, r){
+    const x = w/2, y = h/2;
+    const s = new THREE.Shape();
+    s.moveTo(-x+r, -y);
+    s.lineTo(x-r, -y);
+    s.quadraticCurveTo(x, -y, x, -y+r);
+    s.lineTo(x, y-r);
+    s.quadraticCurveTo(x, y, x-r, y);
+    s.lineTo(-x+r, y);
+    s.quadraticCurveTo(-x, y, -x, y-r);
+    s.lineTo(-x, -y+r);
+    s.quadraticCurveTo(-x, -y, -x+r, -y);
+    return s;
+  }
+  // 圆角立方体（黑色塑料本体）：圆角矩形截面 + 倒角挤出，四面棱角都变圆润
+  function roundedBoxGeometry(w, h, d, r, seg){
+    const sw = Math.max(0.001, w - 2*r), sh = Math.max(0.001, h - 2*r);
+    const geo = new THREE.ExtrudeGeometry(roundedRectShape(sw, sh, r), {
+      depth: Math.max(0.001, d - 2*r),
+      bevelEnabled: true,
+      bevelThickness: r,
+      bevelSize: r,
+      bevelSegments: seg || 3,
+      curveSegments: 6,
+      steps: 1
+    });
+    geo.center();
+    geo.computeVertexNormals();
+    return geo;
+  }
+
   const tScene = new THREE.Scene();
   const tCamera = new THREE.PerspectiveCamera(42, 1, 0.1, 100);
   tCamera.position.set(4.4, 4.0, 5.8); tCamera.lookAt(0,0,0);
@@ -1616,10 +1686,11 @@ if (typeof window !== 'undefined') {
   tRenderer.setPixelRatio(Math.min(window.devicePixelRatio||1, 2));
   sceneEl.appendChild(tRenderer.domElement);
 
-  tScene.add(new THREE.AmbientLight(0xffffff, 0.50));
-  const tKey = new THREE.DirectionalLight(0xffffff, 0.72); tKey.position.set(6,9,7);  tScene.add(tKey);
-  const tFill= new THREE.DirectionalLight(0xffffff, 0.30); tFill.position.set(-7,-2,-5); tScene.add(tFill);
-  const tRim = new THREE.DirectionalLight(0xffffff, 0.18); tRim.position.set(0,-7,4);   tScene.add(tRim);
+  tScene.add(new THREE.AmbientLight(0xffffff, 0.34));
+  tScene.add(new THREE.HemisphereLight(0xffffff, 0x3a3f4a, 0.42));
+  const tKey = new THREE.DirectionalLight(0xffffff, 0.78); tKey.position.set(6,9,7);  tScene.add(tKey);
+  const tFill= new THREE.DirectionalLight(0xffffff, 0.28); tFill.position.set(-7,-2,-5); tScene.add(tFill);
+  const tRim = new THREE.DirectionalLight(0xffffff, 0.20); tRim.position.set(0,-7,4);   tScene.add(tRim);
 
   const viewGroup = new THREE.Group();   // 视角（拖拽 / 空闲自转）
   const cubeGroup = new THREE.Group();   // 魔方本体（26 cubie）
@@ -1630,9 +1701,9 @@ if (typeof window !== 'undefined') {
   const cubieMeshes = [];
   (function buildCubies(){
     const model = CM.solvedCubies();
-    const bodyGeo = new THREE.BoxGeometry(BODY, BODY, BODY);
-    const stkGeo  = new THREE.PlaneGeometry(STK, STK);
-    const bodyMat = new THREE.MeshStandardMaterial({ color:0x15181d, roughness:0.5, metalness:0.04 });
+    const bodyGeo = roundedBoxGeometry(BODY, BODY, BODY, 0.05, 3);   // 圆角黑色塑料本体
+    const stkGeo  = new THREE.ShapeGeometry(roundedRectShape(STK, STK, STK*0.16)); // 圆角贴纸
+    const bodyMat = new THREE.MeshStandardMaterial({ color:0x16191f, roughness:0.42, metalness:0.06 });
     model.forEach(()=>{
       const g = new THREE.Group();
       g.add(new THREE.Mesh(bodyGeo, bodyMat));
@@ -1723,7 +1794,8 @@ if (typeof window !== 'undefined') {
   window.addEventListener('resize', resize); resize();
 
   (function loop(){
-    if(!dragging && !animating){ viewGroup.rotation.y += 0.0035; }  // 空闲缓慢自转
+    // 空闲缓慢自转：仅在未求解、未拖拽、未转动时；还原(求解)期间停止自转，方便看准确每一步
+    if(!dragging && !animating && !solving){ viewGroup.rotation.y += 0.0035; }
     tRenderer.render(tScene, tCamera);
     requestAnimationFrame(loop);
   })();
