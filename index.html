@@ -1980,7 +1980,13 @@ if (typeof window !== 'undefined') {
     progText.textContent=`第 ${pointer} / ${moves.length} 步`;
     progBar.style.width = moves.length? (pointer/moves.length*100)+'%' : '0%';
     doneBanner.classList.toggle('hidden', pointer!==moves.length);
-    if(pointer===moves.length){ curMoveEl.textContent='🎉 已全部完成，魔方还原！'; clearNetFaceMark(); }
+    if(pointer===moves.length){
+      // 还原完成后解锁编辑：允许直接重新涂色开始新的一局
+      solving=false;
+      clearNetFaceMark();
+      curMoveEl.textContent='🎉 还原完成！可直接重新涂色开始新的一局';
+      setMsg('还原完成，已可重新涂色：点「清空」重来，或直接改几格再点「求解还原」。','ok');
+    }
     else if(pointer===0) curMoveEl.textContent='准备开始：点“下一步”或“自动”';
   }
 
